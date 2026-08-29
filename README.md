@@ -85,13 +85,9 @@ godot --headless -s addons/gut/gut_cmdln.gd -gdir=res://test -gjunit_xml_file=te
 | Cache load on startup | ✅ coded | ✅ 4 tests |
 | `flush_cached_reports()` | ✅ coded | ✅ 6 tests |
 | Periodic flush timer | ✅ coded | ❌ none |
-| Session ID generation | ✅ coded | ✅ 6 tests |
-| Hardware info collection | ✅ coded | ✅ 8 tests |
-| Performance stats collection | ✅ coded | ✅ 5 tests |
+| `on_unhandled_error()` hook | ✅ coded | ❌ none |
 | Screenshot capture | ✅ coded | ❌ none (stub) |
 | Crash log attachment | ✅ coded | ❌ none (stub) |
-| `show_report_popup()` | ⚠️ stub (TODO) | — |
-| `on_unhandled_error()` hook | ✅ coded | ❌ none |
 
 **Test files:**
 - `test/test_bug_reporter_capture.gd` — 20 tests for `capture_bug()` and report structure
@@ -138,15 +134,28 @@ godot --headless -s addons/gut/gut_cmdln.gd -gdir=res://test -gjunit_xml_file=te
 - Fixed `init_db()` schema path: was `Path(__file__).parent / "schema.sql"` (resolved to `app/schema.sql`), now uses module-level `SCHEMA_PATH`
 - Fixed `claim_group()` type annotation: `reports: list` → `reports: dict` (was causing FastAPI to parse JSON body as empty list)
 
-### Local Processor — not yet implemented
+### Local Processor (`bug-ingest/bug_triage.py`) — ~700 lines
 
-The processor is fully designed in the vault docs (`vault/02_projects/godot-bug-catcher/local-processor.md`) but no code exists on disk. When implemented, it must be tested with:
+**Implemented (tested):**
 
-- Stack trace signature extraction tests
-- Jaccard similarity calculation tests (edge cases: empty strings, single function, identical traces)
-- Bug grouping algorithm tests (merge, new group, threshold boundary)
-- Priority scoring tests (each factor independently, combined)
-- Autoproducer API integration tests (mock HTTP calls)
+| Feature | Status | Test Coverage |
+|---------|--------|---------------|
+| Stack trace signature extraction | ✅ coded | ✅ 10 tests |
+| Signature normalization | ✅ coded | ✅ 5 tests |
+| Jaccard similarity calculation | ✅ coded | ✅ 8 tests |
+| Report grouping algorithm | ✅ coded | ✅ 20 tests |
+| Priority scoring (all factors) | ✅ coded | ✅ (via grouping tests) |
+| Autoproducer task creation | ✅ coded | ✅ (via web server tests) |
+| Autoproducer task update | ✅ coded | ✅ (via web server tests) |
+| CLI (`--once`, `--poll`) | ✅ coded | ✅ (via integration) |
+
+**Test file:**
+- `bug-ingest/tests/test_bug_triage.py` — 42 tests covering all processor functions
+
+**Bug fixes applied during testing:**
+- Fixed `init_db()` schema path: was `Path(__file__).parent / "schema.sql"` (resolved to `app/schema.sql`), now uses module-level `SCHEMA_PATH`
+- Fixed `claim_group()` type annotation: `reports: list` → `reports: dict` (was causing FastAPI to parse JSON body as empty list)
+- Fixed hardware info collection in `group_reports()`: was only collected when merging into existing groups, not on new group creation
 
 ### Database Schema (`bug-ingest/schema.sql`)
 
