@@ -197,15 +197,17 @@ func capture_bug(p_type: String, p_title: String, p_stack_trace: String,
 
 ## Show a player-triggered bug report popup.
 func show_report_popup() -> void:
-	print("[BugReporter] show_report_popup() — create your custom UI panel here")
-	# TODO: Open a custom UI panel with:
-	# - Title field (pre-filled if from crash)
-	# - Description field
-	# - "Send report" button
-	# - "Don't send" button
-	# - Hardware info toggle (opt-in, defaults to on)
-	# - Screenshot checkbox
-	# - Session ID display (for follow-up reference)
+	# Load and instantiate the popup scene
+	var popup_scene := preload("res://scenes/bug_report_popup.tscn")
+	if not popup_scene:
+		print("[BugReporter] ERROR: Could not load bug_report_popup.tscn")
+		return
+	
+	var popup := popup_scene.instantiate()
+	if popup:
+		get_tree().root.add_child(popup)
+	else:
+		print("[BugReporter] ERROR: Failed to instantiate popup scene")
 
 
 ## Flush all cached reports. Returns count of successfully sent reports.
@@ -286,18 +288,31 @@ func _get_player_position() -> Dictionary:
 	
 	var main_loop := Engine.get_main_loop()
 	if main_loop and main_loop.current_scene:
-		var node := main_loop.current_scene.get_node_or_null("Player")
-		if node:
-			result["x"] = node.position.x if node.has_method("get_position") else 0.0
-			result["y"] = node.position.y if node.has_method("get_position") else 0.0
+		# Try common player node paths
+		var player_path := main_loop.current_scene.get_node_or_null("Player")
+		if not player_path:
+			player_path = main_loop.current_scene.get_node_or_null("CharacterBody2D")
+		if not player_path:
+			# Search all children for a node with position property
+			for child in main_loop.current_scene.get_children():
+				if child.has_method("get_position"):
+					player_path = child
+					break
+		if player_path:
+			var pos := player_path.get_position()
+			result["x"] = pos.x
+			result["y"] = pos.y
 	
 	return result
 
 
 func _collect_hardware_info() -> Dictionary:
+	var gpu_name := "unknown"
+	if DisplayServer.is_feature_available(DisplayServer.FEATURE_GPU_INFO):
+		gpu_name = DisplayServer.get_gpu_vendor() + " - " + DisplayServer.get_gpu_name()
 	return {
 		"os": OS.get_name(),
-		"gpu": DisplayServer.screen_get_dpi() if DisplayServer.is_feature_available(DisplayServer.FEATURE_GPU_INFO) else "unknown",
+		"gpu": gpu_name,
 		"cpu": OS.get_processor_name(),
 		"ram_gb": _get_ram_gb(),
 		"resolution": "%dx%d" % [DisplayServer.window_get_size().x, DisplayServer.window_get_size().y],
@@ -305,8 +320,9 @@ func _collect_hardware_info() -> Dictionary:
 
 
 func _get_ram_gb() -> int:
-	var mem_info := OS.get_memory_status()
-	return max(1, mem_info.total / (1024 * 1024 * 1024))
+	# Estimate total RAM from static memory usage (approximate)
+	var static_mem := OS.get_static_memory_usage()
+	return max(1, static_mem / (1024 * 1024 * 1024))
 
 
 func _collect_performance_stats() -> Dictionary:
@@ -319,15 +335,32 @@ func _collect_performance_stats() -> Dictionary:
 
 
 func _get_memory_usage_mb() -> int:
-	var mem_info := OS.get_memory_status()
-	return max(1, mem_info.used / (1024 * 1024))
+	# Use static memory usage for current process memory (Godot 4.x API)
+	var mem := OS.get_static_memory_usage()
+	return max(1, mem / (1024 * 1024))
 
 
 func _count_orphan_nodes() -> int:
+	# Count nodes that have been freed but not yet collected by the engine
+	# In Godot 4.x, we estimate this by checking for nodes with no parent
 	var count := 0
 	var main_loop := Engine.get_main_loop()
 	if main_loop and main_loop.current_scene:
-		count = main_loop.current_scene.get_child_count()
+		# Traverse scene tree and count nodes without parents (potential orphans)
+		var root := main_loop.current_scene
+		if root:
+			count = _count_unparented_nodes(root)
+	return count
+
+
+func _count_unparented_nodes(node: Node) -> int:
+	var count := 0
+	for child in node.get_children():
+		# Nodes that are children but may have been orphaned during gameplay
+		if not child.is_inside_tree():
+			count += 1
+		else:
+			count += _count_unparented_nodes(child)
 	return count
 
 
@@ -342,11 +375,17 @@ func _should_include_hardware() -> bool:
 func _take_screenshot(report_id: String) -> String:
 	var path := _cache_dir + report_id + ".png"
 	
-	# Capture screen
-	var img := DisplayServer.window_get_image()
-	if img:
-		img.save_png(path)
-		return path
+	# Capture screen using viewport texture (Godot 4.x API)
+	var main_loop := Engine.get_main_loop()
+	if main_loop and main_loop.current_scene:
+		var viewport := main_loop.current_scene.get_viewport()
+		if viewport:
+			var texture := viewport.get_texture()
+			if texture:
+				var img := texture.get_image()
+				if img:
+					img.save_png(path)
+					return path
 	
 	return ""
 

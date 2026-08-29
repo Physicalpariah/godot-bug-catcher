@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "godot-mcp-pro": {
+      "command": "node",
+      "args": ["/home/d_msl/workspace/godot-bug-catcher/godot-mcp-pro/server/build/index.js", "--lite"]
+    }
+  }
+}
