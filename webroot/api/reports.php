@@ -54,6 +54,7 @@ function bugcatcher_handle_intake(): void {
         ? json_encode($data['device_info'])
         : null;
     $logTail = bugcatcher_validate_log_tail($data['log_tail'] ?? null);
+    $stackTrace = bugcatcher_require_string($data, 'stack_trace', BUGCATCHER_MAX_STACK_TRACE_LENGTH, false);
     $screenshotBytes = bugcatcher_validate_screenshot($data['screenshot_base64'] ?? null);
 
     $screenshotPath = $screenshotBytes !== null
@@ -65,10 +66,10 @@ function bugcatcher_handle_intake(): void {
     $stmt = $db->prepare(
         'INSERT INTO reports
             (id, created_at, category, description, repro_steps, contact,
-             device_info, app_version, scene_context, log_tail, screenshot_path)
+             device_info, app_version, scene_context, log_tail, stack_trace, screenshot_path)
          VALUES
             (:id, NOW(), :category, :description, :repro_steps, :contact,
-             :device_info, :app_version, :scene_context, :log_tail, :screenshot_path)
+             :device_info, :app_version, :scene_context, :log_tail, :stack_trace, :screenshot_path)
          ON DUPLICATE KEY UPDATE id = id'
     );
     $stmt->execute([
@@ -81,6 +82,7 @@ function bugcatcher_handle_intake(): void {
         'app_version' => $appVersion !== '' ? $appVersion : null,
         'scene_context' => $sceneContext !== '' ? $sceneContext : null,
         'log_tail' => $logTail,
+        'stack_trace' => $stackTrace !== '' ? $stackTrace : null,
         'screenshot_path' => $screenshotPath,
     ]);
 
@@ -98,7 +100,7 @@ function bugcatcher_handle_read(): void {
     }
 
     $sql = 'SELECT id, created_at, category, description, repro_steps, contact,
-                   device_info, app_version, scene_context, log_tail, screenshot_path
+                   device_info, app_version, scene_context, log_tail, stack_trace, screenshot_path
             FROM reports';
     $params = [];
     if ($since !== null) {

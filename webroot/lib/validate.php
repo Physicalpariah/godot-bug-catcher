@@ -4,6 +4,7 @@ declare(strict_types=1);
 const BUGCATCHER_MAX_TEXT_LENGTH = 4000;
 const BUGCATCHER_MAX_LOG_LINES = 300; // matches the Godot client's LogUtils ring buffer cap
 const BUGCATCHER_MAX_LOG_LINE_LENGTH = 2000;
+const BUGCATCHER_MAX_STACK_TRACE_LENGTH = 8000;
 const BUGCATCHER_MAX_SCREENSHOT_BYTES = 2 * 1024 * 1024; // decoded PNG bytes
 const BUGCATCHER_VALID_CATEGORIES = ['_crash', '_visual', '_gameplay', '_balance', '_performance', '_other'];
 

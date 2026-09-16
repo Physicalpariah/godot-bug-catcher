@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS reports (
     app_version VARCHAR(100) NULL,
     scene_context VARCHAR(200) NULL,
     log_tail MEDIUMTEXT NULL,
+    stack_trace MEDIUMTEXT NULL,
     screenshot_path VARCHAR(255) NULL,
     INDEX idx_reports_created_at (created_at),
     INDEX idx_reports_category (category)
