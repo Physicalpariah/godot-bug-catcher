@@ -2,3 +2,8 @@ config.php
 screenshots/
 *.log
 .DS_Store
+processor/.env
+processor/data/
+processor/__pycache__/
+processor/tests/__pycache__/
+processor/.pytest_cache/

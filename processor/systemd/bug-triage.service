@@ -1,0 +1,10 @@
+[Unit]
+Description=Bug Catcher local processor — pull, group, score (one cycle)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/workspace/godot-bug-catcher/processor
+ExecStart=%h/workspace/godot-bug-catcher/processor/.venv/bin/python3 bug_triage.py --once
+Environment=BUGCATCHER_API_URL=https://bugs.anchoritegames.com/api/reports.php
+Environment=BUGCATCHER_BEARER_TOKEN=REPLACE_ME
+Environment=BUGCATCHER_DB_PATH=%h/workspace/godot-bug-catcher/processor/data/bug_processor.db
