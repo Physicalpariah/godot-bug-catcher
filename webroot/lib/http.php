@@ -36,11 +36,31 @@ function bugcatcher_read_json_body(int $maxBytes): array {
     return $data;
 }
 
+// many Apache/CGI setups (Dreamhost included) strip the standard
+// Authorization header before PHP ever sees it, unless the webroot's
+// .htaccess explicitly re-exposes it — check every path it can arrive by
+function bugcatcher_get_authorization_header(): string {
+    if (!empty($_SERVER['HTTP_AUTHORIZATION'])) {
+        return $_SERVER['HTTP_AUTHORIZATION'];
+    }
+    if (!empty($_SERVER['REDIRECT_HTTP_AUTHORIZATION'])) {
+        return $_SERVER['REDIRECT_HTTP_AUTHORIZATION'];
+    }
+    if (function_exists('apache_request_headers')) {
+        foreach (apache_request_headers() as $name => $value) {
+            if (strcasecmp($name, 'Authorization') === 0) {
+                return $value;
+            }
+        }
+    }
+    return '';
+}
+
 // real auth for the processor's read-only pull — distinct from the client's
 // soft token, which only guards public intake and is not a secret
 function bugcatcher_require_bearer_token(): void {
     $cfg = bugcatcher_config();
-    $header = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+    $header = bugcatcher_get_authorization_header();
     if (!preg_match('/^Bearer\s+(.+)$/i', $header, $matches) || !hash_equals($cfg['bearer_token'], $matches[1])) {
         bugcatcher_json_response(401, ['error' => 'unauthorized']);
     }

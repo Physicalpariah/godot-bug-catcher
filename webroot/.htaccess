@@ -1,0 +1,6 @@
+# Dreamhost's Apache/CGI setup strips the Authorization header before PHP
+# ever sees it by default — this re-exposes it as HTTP_AUTHORIZATION so
+# lib/http.php's bearer-token check actually has something to read.
+RewriteEngine On
+RewriteCond %{HTTP:Authorization} ^(.*)
+RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
