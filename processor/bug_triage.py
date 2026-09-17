@@ -382,7 +382,16 @@ def run_once(
         set_state(conn, "last_pull_at", latest_created_at)
 
     if autoproducer_project_id is not None:
-        for signature in touched_signatures:
+        # touched_signatures alone would leave a group stuck forever if it
+        # was first seen before AUTOPRODUCER_PROJECT_ID was configured, or a
+        # prior sync attempt failed (Auto-Producer down, wrong URL, etc.) —
+        # nothing else ever "touches" it again unless the same bug recurs.
+        # Retrying every never-yet-created group every cycle makes that
+        # self-healing instead of a permanent gap.
+        never_synced = {
+            r["signature"] for r in conn.execute("SELECT signature FROM groups WHERE autoproducer_task_id IS NULL")
+        }
+        for signature in touched_signatures | never_synced:
             try:
                 sync_group_to_autoproducer(conn, autoproducer_url, autoproducer_project_id, signature)
             except requests.RequestException as exc:

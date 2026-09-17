@@ -234,6 +234,45 @@ def test_run_once_pushes_touched_groups_when_project_id_configured(conn):
     mock_post.assert_called_once()
 
 
+def test_run_once_retries_a_group_never_successfully_synced(conn):
+    # simulates a group first seen on an earlier cycle when AUTOPRODUCER_PROJECT_ID
+    # was unset (or a prior sync attempt failed) — no new report for it this
+    # cycle, so it's absent from touched_signatures, but it should still get
+    # picked up since autoproducer_task_id is still NULL
+    old_report = make_report(id="old", created_at="2026-09-17 09:00:00")
+    sig = bt.report_signature(old_report)
+    bt.upsert_group(conn, old_report, sig)
+    bt.mark_processed(conn, old_report.id, sig)
+    conn.commit()
+
+    with patch.object(bt, "fetch_new_reports", return_value=[]), \
+         patch.object(bt.requests, "post") as mock_post:
+        mock_post.return_value.json.return_value = {"id": 55}
+        mock_post.return_value.raise_for_status.return_value = None
+        bt.run_once(conn, "http://fake", "token", "http://fake:8420", autoproducer_project_id=7)
+
+    mock_post.assert_called_once()
+    group = conn.execute("SELECT * FROM groups WHERE signature = ?", (sig,)).fetchone()
+    assert group["autoproducer_task_id"] == 55
+
+
+def test_run_once_does_not_retry_a_group_already_synced(conn):
+    old_report = make_report(id="old", created_at="2026-09-17 09:00:00")
+    sig = bt.report_signature(old_report)
+    bt.upsert_group(conn, old_report, sig)
+    conn.execute("UPDATE groups SET autoproducer_task_id = 55 WHERE signature = ?", (sig,))
+    bt.mark_processed(conn, old_report.id, sig)
+    conn.commit()
+
+    with patch.object(bt, "fetch_new_reports", return_value=[]), \
+         patch.object(bt.requests, "post") as mock_post, \
+         patch.object(bt.requests, "patch") as mock_patch:
+        bt.run_once(conn, "http://fake", "token", "http://fake:8420", autoproducer_project_id=7)
+
+    mock_post.assert_not_called()
+    mock_patch.assert_not_called()  # no new occurrence, already synced — nothing to do
+
+
 def test_run_once_does_not_push_when_project_id_unset(conn):
     reports = [make_report(id="a", created_at="2026-09-17 10:00:00")]
     with patch.object(bt, "fetch_new_reports", return_value=reports), \
