@@ -2,23 +2,29 @@
 
 Pulls new reports from the Dreamhost intake service, groups similar ones
 (crash reports by normalized stack-trace signature; everything else gets
-its own group for now — see report_signature()), scores priority, and
-persists the result locally in SQLite.
+its own group for now — see report_signature()), scores priority, persists
+the result locally in SQLite, and pushes each touched group into
+Auto-Producer as a task (creating it the first time, updating it on every
+later occurrence). Auto-Producer is the only triage surface — there is no
+separate bug-catcher admin UI, and no status ever flows back from there.
 
-Does NOT push to Auto-Producer yet — that integration is on hold until
-Auto-Producer gets a real priority field (tracked separately, by the user,
-in Auto-Producer's own project). This script's job for now is pull, group,
-score, and print a summary so the pipeline can be seen working before the
-next component is built on top of it.
+The push always wins: every cycle unconditionally overwrites a synced
+task's title/notes/priority in Auto-Producer, including over a human's
+manual drag-reorder there. Deliberate — the user's call, see vault:
+godot-bug-catcher-autoproducer-integration.
 
 Usage:
     python3 bug_triage.py --once
     python3 bug_triage.py --poll [--interval 300]
 
 Config (environment variables):
-    BUGCATCHER_API_URL      default: https://bugs.anchoritegames.com/api/reports.php
-    BUGCATCHER_BEARER_TOKEN required — the same token issued in config.php on Dreamhost
-    BUGCATCHER_DB_PATH      default: data/bug_processor.db
+    BUGCATCHER_API_URL       default: https://bugs.anchoritegames.com/api/reports.php
+    BUGCATCHER_BEARER_TOKEN  required — the same token issued in config.php on Dreamhost
+    BUGCATCHER_DB_PATH       default: data/bug_processor.db
+    AUTOPRODUCER_URL         default: http://127.0.0.1:8420 (same host, no Tailscale hop needed)
+    AUTOPRODUCER_PROJECT_ID  the Auto-Producer project bug-catcher tasks are created under —
+                             must already exist (created once, by hand, in Auto-Producer).
+                             Left unset: pull/group/score still runs, nothing gets pushed.
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ import requests
 DEFAULT_API_URL = "https://bugs.anchoritegames.com/api/reports.php"
 DEFAULT_DB_PATH = "data/bug_processor.db"
 DEFAULT_POLL_INTERVAL = 300  # 5 minutes
+DEFAULT_AUTOPRODUCER_URL = "http://127.0.0.1:8420"
 
 # tunable starting point, not a locked design — revisit once real report
 # volume exists to tune against (see vault: godot-bug-catcher-local-processor)
@@ -161,7 +168,8 @@ CREATE TABLE IF NOT EXISTS groups (
     first_seen TEXT NOT NULL,
     last_seen TEXT NOT NULL,
     priority_score REAL NOT NULL DEFAULT 0.0,
-    device_versions TEXT NOT NULL DEFAULT '[]'
+    device_versions TEXT NOT NULL DEFAULT '[]',
+    autoproducer_task_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS processed_reports (
@@ -178,7 +186,18 @@ def open_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate_schema(conn)
     return conn
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    # CREATE TABLE IF NOT EXISTS above only helps a brand-new DB — an
+    # already-running deployment's groups table predates autoproducer_task_id
+    # and needs it added by hand, same idiom Auto-Producer's own migrations use.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(groups)")}
+    if "autoproducer_task_id" not in cols:
+        conn.execute("ALTER TABLE groups ADD COLUMN autoproducer_task_id INTEGER")
+        conn.commit()
 
 
 def get_state(conn: sqlite3.Connection, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -282,14 +301,71 @@ def fetch_new_reports(api_url: str, bearer_token: str, since: Optional[str]) -> 
     return [Report.from_dict(r) for r in data.get("reports", [])]
 
 
+# ── Pushing to Auto-Producer ─────────────────────────────────────────────────
+
+def _autoproducer_task_title(group: sqlite3.Row) -> str:
+    if group["report_count"] <= 1:
+        return group["representative_title"]
+    return f"{group['representative_title']} (×{group['report_count']} reports)"
+
+
+def _autoproducer_task_notes(group: sqlite3.Row) -> str:
+    device_versions = json.loads(group["device_versions"])
+    lines = [
+        f"bug-catcher group: {group['signature']}",
+        f"reports: {group['report_count']}",
+        f"devices/versions: {', '.join(device_versions) if device_versions else 'unknown'}",
+    ]
+    if group["representative_stack_trace"]:
+        lines += ["", "stack trace:", group["representative_stack_trace"]]
+    return "\n".join(lines)
+
+
+def sync_group_to_autoproducer(conn: sqlite3.Connection, autoproducer_url: str, project_id: int, signature: str) -> None:
+    """Always overwrites — see the module docstring for why the push wins
+    unconditionally over anything currently in Auto-Producer, drag included.
+    """
+    group = conn.execute("SELECT * FROM groups WHERE signature = ?", (signature,)).fetchone()
+    if group is None:
+        return
+
+    payload = {
+        "title": _autoproducer_task_title(group),
+        "notes": _autoproducer_task_notes(group),
+        "priority": group["priority_score"],
+    }
+
+    if group["autoproducer_task_id"] is None:
+        response = requests.post(
+            f"{autoproducer_url}/api/tasks", json={**payload, "project_id": project_id}, timeout=15
+        )
+        response.raise_for_status()
+        task_id = response.json()["id"]
+        conn.execute("UPDATE groups SET autoproducer_task_id = ? WHERE signature = ?", (task_id, signature))
+        conn.commit()
+        logger.info("created Auto-Producer task %d for group %s", task_id, signature)
+    else:
+        task_id = group["autoproducer_task_id"]
+        response = requests.patch(f"{autoproducer_url}/api/tasks/{task_id}", json=payload, timeout=15)
+        response.raise_for_status()
+        logger.info("updated Auto-Producer task %d for group %s", task_id, signature)
+
+
 # ── Main cycle ────────────────────────────────────────────────────────────────
 
-def run_once(conn: sqlite3.Connection, api_url: str, bearer_token: str) -> int:
+def run_once(
+    conn: sqlite3.Connection,
+    api_url: str,
+    bearer_token: str,
+    autoproducer_url: Optional[str] = None,
+    autoproducer_project_id: Optional[int] = None,
+) -> int:
     since = get_state(conn, "last_pull_at")
     reports = fetch_new_reports(api_url, bearer_token, since)
 
     new_count = 0
     latest_created_at = since
+    touched_signatures: set[str] = set()
     for report in reports:
         if is_processed(conn, report.id):
             continue
@@ -297,12 +373,20 @@ def run_once(conn: sqlite3.Connection, api_url: str, bearer_token: str) -> int:
         upsert_group(conn, report, signature)
         mark_processed(conn, report.id, signature)
         conn.commit()
+        touched_signatures.add(signature)
         new_count += 1
         if latest_created_at is None or report.created_at > latest_created_at:
             latest_created_at = report.created_at
 
     if latest_created_at:
         set_state(conn, "last_pull_at", latest_created_at)
+
+    if autoproducer_project_id is not None:
+        for signature in touched_signatures:
+            try:
+                sync_group_to_autoproducer(conn, autoproducer_url, autoproducer_project_id, signature)
+            except requests.RequestException as exc:
+                logger.error("Auto-Producer sync failed for group %s: %s", signature, exc)
 
     logger.info("pulled %d report(s), %d new", len(reports), new_count)
     print_summary(conn)
@@ -332,10 +416,15 @@ def main() -> None:
     api_url = os.environ.get("BUGCATCHER_API_URL", DEFAULT_API_URL)
     bearer_token = os.environ.get("BUGCATCHER_BEARER_TOKEN")
     db_path = os.environ.get("BUGCATCHER_DB_PATH", DEFAULT_DB_PATH)
+    autoproducer_url = os.environ.get("AUTOPRODUCER_URL", DEFAULT_AUTOPRODUCER_URL)
+    autoproducer_project_id_raw = os.environ.get("AUTOPRODUCER_PROJECT_ID")
+    autoproducer_project_id = int(autoproducer_project_id_raw) if autoproducer_project_id_raw else None
 
     if not bearer_token:
         logger.error("BUGCATCHER_BEARER_TOKEN is not set — refusing to start")
         sys.exit(1)
+    if autoproducer_project_id is None:
+        logger.info("AUTOPRODUCER_PROJECT_ID not set — grouping/scoring only, nothing will be pushed")
 
     conn = open_db(db_path)
 
@@ -343,12 +432,12 @@ def main() -> None:
         logger.info("polling every %ds", args.interval)
         while True:
             try:
-                run_once(conn, api_url, bearer_token)
+                run_once(conn, api_url, bearer_token, autoproducer_url, autoproducer_project_id)
             except requests.RequestException as exc:
                 logger.error("pull failed: %s", exc)
             time.sleep(args.interval)
     else:
-        run_once(conn, api_url, bearer_token)
+        run_once(conn, api_url, bearer_token, autoproducer_url, autoproducer_project_id)
 
 
 if __name__ == "__main__":

@@ -145,6 +145,104 @@ def test_upsert_group_tracks_distinct_device_versions(conn):
 
 # ── run_once — pull cursor + idempotency ────────────────────────────────────
 
+def test_schema_migration_adds_autoproducer_task_id_to_legacy_db(tmp_path):
+    # simulates a groups table that predates the column, same as a real
+    # already-running deployment's SQLite file before this feature shipped
+    import sqlite3
+    db_path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript("""
+        CREATE TABLE groups (
+            signature TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            representative_title TEXT NOT NULL,
+            representative_stack_trace TEXT,
+            report_count INTEGER NOT NULL DEFAULT 0,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            priority_score REAL NOT NULL DEFAULT 0.0,
+            device_versions TEXT NOT NULL DEFAULT '[]'
+        );
+    """)
+    legacy.close()
+
+    conn = bt.open_db(str(db_path))
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(groups)")}
+    assert "autoproducer_task_id" in cols
+
+
+# ── Auto-Producer sync ──────────────────────────────────────────────────────
+
+def test_task_title_includes_count_only_when_more_than_one(conn):
+    report = make_report()
+    sig = bt.report_signature(report)
+    bt.upsert_group(conn, report, sig)
+    group = conn.execute("SELECT * FROM groups WHERE signature = ?", (sig,)).fetchone()
+    assert bt._autoproducer_task_title(group) == report.description  # no "(×1 reports)" suffix
+
+    bt.upsert_group(conn, make_report(id="report-2"), sig)
+    group = conn.execute("SELECT * FROM groups WHERE signature = ?", (sig,)).fetchone()
+    assert bt._autoproducer_task_title(group) == f"{report.description} (×2 reports)"
+
+
+def test_sync_creates_task_when_no_autoproducer_task_id_yet(conn):
+    report = make_report()
+    sig = bt.report_signature(report)
+    bt.upsert_group(conn, report, sig)
+    conn.commit()
+
+    with patch.object(bt.requests, "post") as mock_post:
+        mock_post.return_value.json.return_value = {"id": 42}
+        mock_post.return_value.raise_for_status.return_value = None
+        bt.sync_group_to_autoproducer(conn, "http://fake:8420", project_id=7, signature=sig)
+
+    mock_post.assert_called_once()
+    call_url, call_kwargs = mock_post.call_args[0][0], mock_post.call_args[1]
+    assert call_url == "http://fake:8420/api/tasks"
+    assert call_kwargs["json"]["project_id"] == 7
+    assert call_kwargs["json"]["title"] == report.description
+
+    group = conn.execute("SELECT * FROM groups WHERE signature = ?", (sig,)).fetchone()
+    assert group["autoproducer_task_id"] == 42
+
+
+def test_sync_updates_existing_task_instead_of_recreating(conn):
+    report = make_report()
+    sig = bt.report_signature(report)
+    bt.upsert_group(conn, report, sig)
+    conn.execute("UPDATE groups SET autoproducer_task_id = 99 WHERE signature = ?", (sig,))
+    conn.commit()
+
+    with patch.object(bt.requests, "patch") as mock_patch, patch.object(bt.requests, "post") as mock_post:
+        mock_patch.return_value.raise_for_status.return_value = None
+        bt.sync_group_to_autoproducer(conn, "http://fake:8420", project_id=7, signature=sig)
+
+    mock_post.assert_not_called()
+    mock_patch.assert_called_once()
+    assert mock_patch.call_args[0][0] == "http://fake:8420/api/tasks/99"
+    assert "project_id" not in mock_patch.call_args[1]["json"]  # never re-sent on update
+
+
+def test_run_once_pushes_touched_groups_when_project_id_configured(conn):
+    reports = [make_report(id="a", created_at="2026-09-17 10:00:00")]
+    with patch.object(bt, "fetch_new_reports", return_value=reports), \
+         patch.object(bt.requests, "post") as mock_post:
+        mock_post.return_value.json.return_value = {"id": 1}
+        mock_post.return_value.raise_for_status.return_value = None
+        bt.run_once(conn, "http://fake", "token", "http://fake:8420", autoproducer_project_id=7)
+
+    mock_post.assert_called_once()
+
+
+def test_run_once_does_not_push_when_project_id_unset(conn):
+    reports = [make_report(id="a", created_at="2026-09-17 10:00:00")]
+    with patch.object(bt, "fetch_new_reports", return_value=reports), \
+         patch.object(bt.requests, "post") as mock_post:
+        bt.run_once(conn, "http://fake", "token", autoproducer_url=None, autoproducer_project_id=None)
+
+    mock_post.assert_not_called()
+
+
 def test_run_once_advances_cursor_and_skips_already_processed(conn):
     reports_batch_1 = [make_report(id="a", created_at="2026-09-17 10:00:00")]
     reports_batch_2 = [
