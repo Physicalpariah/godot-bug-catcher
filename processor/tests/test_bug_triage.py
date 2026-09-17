@@ -1,3 +1,4 @@
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -171,6 +172,32 @@ def test_schema_migration_adds_autoproducer_task_id_to_legacy_db(tmp_path):
     assert "autoproducer_task_id" in cols
 
 
+# ── Local report storage (for viewer.py) ───────────────────────────────────
+
+def test_store_report_persists_full_detail(conn):
+    report = make_report(repro_steps="1. do the thing\n2. crash", contact="me@example.com")
+    sig = bt.report_signature(report)
+    bt.store_report(conn, report, sig)
+    conn.commit()
+
+    row = conn.execute("SELECT * FROM reports WHERE id = ?", (report.id,)).fetchone()
+    assert row["signature"] == sig
+    assert row["repro_steps"] == "1. do the thing\n2. crash"
+    assert row["contact"] == "me@example.com"
+    assert row["description"] == report.description
+    assert json.loads(row["device_info"])["model"] == "iPhone14,2"
+
+
+def test_run_once_stores_reports_for_the_viewer(conn):
+    reports = [make_report(id="a", created_at="2026-09-17 10:00:00", contact="me@example.com")]
+    with patch.object(bt, "fetch_new_reports", return_value=reports):
+        bt.run_once(conn, "http://fake", "token")
+
+    row = conn.execute("SELECT * FROM reports WHERE id = 'a'").fetchone()
+    assert row is not None
+    assert row["contact"] == "me@example.com"
+
+
 # ── Auto-Producer sync ──────────────────────────────────────────────────────
 
 def test_task_title_includes_count_only_when_more_than_one(conn):
@@ -183,6 +210,17 @@ def test_task_title_includes_count_only_when_more_than_one(conn):
     bt.upsert_group(conn, make_report(id="report-2"), sig)
     group = conn.execute("SELECT * FROM groups WHERE signature = ?", (sig,)).fetchone()
     assert bt._autoproducer_task_title(group) == f"{report.description} (×2 reports)"
+
+
+def test_task_notes_include_viewer_link_only_when_configured(conn):
+    report = make_report()
+    sig = bt.report_signature(report)
+    bt.upsert_group(conn, report, sig)
+    group = conn.execute("SELECT * FROM groups WHERE signature = ?", (sig,)).fetchone()
+
+    assert "http" not in bt._autoproducer_task_notes(group, viewer_url=None)
+    notes = bt._autoproducer_task_notes(group, viewer_url="http://ruin-1:8422")
+    assert f"http://ruin-1:8422/groups/{sig}" in notes
 
 
 def test_sync_creates_task_when_no_autoproducer_task_id_yet(conn):

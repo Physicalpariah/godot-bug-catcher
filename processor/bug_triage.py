@@ -177,6 +177,28 @@ CREATE TABLE IF NOT EXISTS processed_reports (
     signature TEXT NOT NULL,
     processed_at TEXT NOT NULL
 );
+
+-- Full report detail, kept locally rather than discarded after grouping —
+-- viewer.py (a separate small FastAPI service, Tailscale-only, no auth of
+-- its own) reads this to render a report's/group's full detail: repro
+-- steps, contact, device info, the complete log tail, and the screenshot —
+-- everything that's too much to cram into an Auto-Producer task's notes.
+CREATE TABLE IF NOT EXISTS reports (
+    id TEXT PRIMARY KEY,
+    signature TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    category TEXT NOT NULL,
+    description TEXT NOT NULL,
+    repro_steps TEXT,
+    contact TEXT,
+    device_info TEXT,
+    app_version TEXT,
+    scene_context TEXT,
+    log_tail TEXT,
+    stack_trace TEXT,
+    screenshot_base64 TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reports_signature ON reports(signature);
 """
 
 
@@ -185,6 +207,10 @@ def open_db(db_path: str) -> sqlite3.Connection:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    # WAL mode: viewer.py reads this same file from a separate process while
+    # the poller writes to it every cycle — WAL lets that happen without
+    # "database is locked" errors from the default rollback-journal mode.
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
     _migrate_schema(conn)
     return conn
@@ -212,6 +238,22 @@ def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
         (key, value),
     )
     conn.commit()
+
+
+def store_report(conn: sqlite3.Connection, report: "Report", signature: str) -> None:
+    conn.execute(
+        """INSERT OR REPLACE INTO reports
+            (id, signature, created_at, category, description, repro_steps, contact,
+             device_info, app_version, scene_context, log_tail, stack_trace, screenshot_base64)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            report.id, signature, report.created_at, report.category, report.description,
+            report.repro_steps, report.contact,
+            json.dumps(report.device_info) if report.device_info is not None else None,
+            report.app_version, report.scene_context, report.log_tail, report.stack_trace,
+            report.screenshot_base64,
+        ),
+    )
 
 
 def is_processed(conn: sqlite3.Connection, report_id: str) -> bool:
@@ -309,7 +351,7 @@ def _autoproducer_task_title(group: sqlite3.Row) -> str:
     return f"{group['representative_title']} (×{group['report_count']} reports)"
 
 
-def _autoproducer_task_notes(group: sqlite3.Row) -> str:
+def _autoproducer_task_notes(group: sqlite3.Row, viewer_url: Optional[str]) -> str:
     device_versions = json.loads(group["device_versions"])
     lines = [
         f"bug-catcher group: {group['signature']}",
@@ -318,10 +360,14 @@ def _autoproducer_task_notes(group: sqlite3.Row) -> str:
     ]
     if group["representative_stack_trace"]:
         lines += ["", "stack trace:", group["representative_stack_trace"]]
+    if viewer_url:
+        lines += ["", f"full details (repro steps, contact, log, screenshot): {viewer_url}/groups/{group['signature']}"]
     return "\n".join(lines)
 
 
-def sync_group_to_autoproducer(conn: sqlite3.Connection, autoproducer_url: str, project_id: int, signature: str) -> None:
+def sync_group_to_autoproducer(
+    conn: sqlite3.Connection, autoproducer_url: str, project_id: int, signature: str, viewer_url: Optional[str] = None
+) -> None:
     """Always overwrites — see the module docstring for why the push wins
     unconditionally over anything currently in Auto-Producer, drag included.
     """
@@ -331,7 +377,7 @@ def sync_group_to_autoproducer(conn: sqlite3.Connection, autoproducer_url: str, 
 
     payload = {
         "title": _autoproducer_task_title(group),
-        "notes": _autoproducer_task_notes(group),
+        "notes": _autoproducer_task_notes(group, viewer_url),
         "priority": group["priority_score"],
     }
 
@@ -359,6 +405,7 @@ def run_once(
     bearer_token: str,
     autoproducer_url: Optional[str] = None,
     autoproducer_project_id: Optional[int] = None,
+    viewer_url: Optional[str] = None,
 ) -> int:
     since = get_state(conn, "last_pull_at")
     reports = fetch_new_reports(api_url, bearer_token, since)
@@ -371,6 +418,7 @@ def run_once(
             continue
         signature = report_signature(report)
         upsert_group(conn, report, signature)
+        store_report(conn, report, signature)
         mark_processed(conn, report.id, signature)
         conn.commit()
         touched_signatures.add(signature)
@@ -393,7 +441,7 @@ def run_once(
         }
         for signature in touched_signatures | never_synced:
             try:
-                sync_group_to_autoproducer(conn, autoproducer_url, autoproducer_project_id, signature)
+                sync_group_to_autoproducer(conn, autoproducer_url, autoproducer_project_id, signature, viewer_url)
             except requests.RequestException as exc:
                 logger.error("Auto-Producer sync failed for group %s: %s", signature, exc)
 
@@ -428,12 +476,15 @@ def main() -> None:
     autoproducer_url = os.environ.get("AUTOPRODUCER_URL", DEFAULT_AUTOPRODUCER_URL)
     autoproducer_project_id_raw = os.environ.get("AUTOPRODUCER_PROJECT_ID")
     autoproducer_project_id = int(autoproducer_project_id_raw) if autoproducer_project_id_raw else None
+    viewer_url = os.environ.get("BUGCATCHER_VIEWER_URL")  # e.g. http://<tailscale-host>:8422 — see viewer.py
 
     if not bearer_token:
         logger.error("BUGCATCHER_BEARER_TOKEN is not set — refusing to start")
         sys.exit(1)
     if autoproducer_project_id is None:
         logger.info("AUTOPRODUCER_PROJECT_ID not set — grouping/scoring only, nothing will be pushed")
+    if viewer_url is None:
+        logger.info("BUGCATCHER_VIEWER_URL not set — Auto-Producer notes won't include a details link")
 
     conn = open_db(db_path)
 
@@ -441,12 +492,12 @@ def main() -> None:
         logger.info("polling every %ds", args.interval)
         while True:
             try:
-                run_once(conn, api_url, bearer_token, autoproducer_url, autoproducer_project_id)
+                run_once(conn, api_url, bearer_token, autoproducer_url, autoproducer_project_id, viewer_url)
             except requests.RequestException as exc:
                 logger.error("pull failed: %s", exc)
             time.sleep(args.interval)
     else:
-        run_once(conn, api_url, bearer_token, autoproducer_url, autoproducer_project_id)
+        run_once(conn, api_url, bearer_token, autoproducer_url, autoproducer_project_id, viewer_url)
 
 
 if __name__ == "__main__":
