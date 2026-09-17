@@ -261,7 +261,10 @@ def upsert_group(conn: sqlite3.Connection, report: Report, signature: str, now: 
 
     priority = calculate_priority(report_count, last_seen, len(device_versions_list), now=now)
     conn.execute("UPDATE groups SET priority_score = ? WHERE signature = ?", (priority, signature))
-    conn.commit()
+    # no commit here — the caller commits once both this and mark_processed()
+    # have run, so a kill between the two (e.g. systemd stop mid-cycle) can't
+    # leave a report counted in a group but not recorded as processed, which
+    # would double-count it on the next run
 
 
 # ── Pulling from the Dreamhost API ───────────────────────────────────────────
@@ -293,6 +296,7 @@ def run_once(conn: sqlite3.Connection, api_url: str, bearer_token: str) -> int:
         signature = report_signature(report)
         upsert_group(conn, report, signature)
         mark_processed(conn, report.id, signature)
+        conn.commit()
         new_count += 1
         if latest_created_at is None or report.created_at > latest_created_at:
             latest_created_at = report.created_at
